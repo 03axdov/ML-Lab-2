@@ -1,3 +1,5 @@
+import os
+import numpy as np
 import tensorflow as tf
 from dataset_generator import *
 
@@ -26,6 +28,16 @@ def main():
 
     model.fit(train_ds, validation_data=test_ds, epochs=10)
 
+    # Few-shot evaluation using nearest prototypes on test identities
+    # Use penultimate Dense(128) as the embedding and L2-normalize
+    embedding_model = tf.keras.Model(model.input, model.layers[-2].output)
+
+    # Save models for later inference
+    os.makedirs("models", exist_ok=True)
+    model.save("models/cls_model.keras")
+    embedding_model.save("models/embed_model.keras")
+
 
 if __name__ == "__main__":
+    print("GPUs Available: ", tf.config.list_physical_devices('GPU'))
     main()

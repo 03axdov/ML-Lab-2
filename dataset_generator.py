@@ -75,6 +75,57 @@ def prepare_dataset(data_dir, max_len=2000, vocab_size=20000, test_split=0.2, ca
     return train_ds, test_ds, tokenizer, label_encoder
 
 
+def prepare_frames_dataset(
+    data_dir,
+    board_size: int = 19,
+    history_k: int = 4,
+    max_moves: int = 200,
+    test_split: float = 0.2,
+    batch_size: int = 16,
+    shuffle_buffer: int = 1024,
+):
+    """Create tf.data.Dataset of per-move spatial frames for each game.
+
+    Each sample: tensor of shape (max_moves, board_size, board_size, C) where
+    C = 2*history_k + 2. Labels are integer-encoded player IDs from file headers.
+    """
+    games, labels = load_all_games(data_dir)
+
+    # Encode labels (if None, encode as 'unknown')
+    labels = [lab if lab is not None else "<UNK>" for lab in labels]
+    label_encoder = LabelEncoder()
+    y = label_encoder.fit_transform(labels)
+
+    # Stratified split indices
+    from sklearn.model_selection import train_test_split as _tts
+
+    idx = np.arange(len(games))
+    train_idx, test_idx, y_train, y_test = _tts(
+        idx, y, test_size=test_split, stratify=y, random_state=42, shuffle=True
+    )
+
+    def gen(subset_idx):
+        for i in subset_idx:
+            sgf = games[i]
+            moves = extract_moves_from_sgf(sgf, board_size=board_size)
+            frames = moves_to_frames(moves, board_size=board_size, history_k=history_k, max_moves=max_moves)
+            yield frames, y[i]
+
+    C = 2 * history_k + 2
+    output_signature = (
+        tf.TensorSpec(shape=(max_moves, board_size, board_size, C), dtype=tf.float32),
+        tf.TensorSpec(shape=(), dtype=tf.int64),
+    )
+
+    train_ds = tf.data.Dataset.from_generator(lambda: gen(train_idx), output_signature=output_signature)
+    test_ds = tf.data.Dataset.from_generator(lambda: gen(test_idx), output_signature=output_signature)
+
+    train_ds = train_ds.shuffle(shuffle_buffer).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    test_ds = test_ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    return train_ds, test_ds, label_encoder
+
+
 if __name__ == "__main__":
     DATA_DIR = "data/train_set"
     train_ds, test_ds, tokenizer, label_encoder = prepare_dataset(DATA_DIR)
