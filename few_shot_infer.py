@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import tensorflow as tf
 
-from data_parser import parse_sgf_file, extract_moves_from_sgf, moves_to_frames
+from data_parser import parse_sgf_file, extract_moves_from_sgf, moves_to_frames, moves_to_stack
 
 
 def texts_to_padded(texts: List[str], tokenizer, max_len: int) -> np.ndarray:
@@ -87,9 +87,18 @@ def run_few_shot(
         ishape = input_shape[0]
     else:
         ishape = input_shape
-    use_frames = len(ishape) == 5  # [B, T, H, W, C]
+    use_frames_or_stack = len(ishape) == 5  # [B, T, H, W, C]
+    use_stack = False
+    use_frames = False
+    if use_frames_or_stack:
+        # Decide by channel count: small C (<=4) => stack, else frames with history
+        _, T_in, H_in, W_in, C_in = ishape
+        if C_in is not None and int(C_in) <= 4:
+            use_stack = True
+        else:
+            use_frames = True
     tokenizer = None
-    if not use_frames:
+    if not (use_frames or use_stack):
         with open(tokenizer_path, "rb") as f:
             tokenizer = pickle.load(f)
 
@@ -130,6 +139,17 @@ def run_few_shot(
             fr = moves_to_frames(mv, board_size=H, history_k=history_k, max_moves=T)
             cand_frames.append(fr)
         X_cand = np.stack(cand_frames, axis=0)
+    elif use_stack:
+        _, T, H, W, C = ishape
+        T = int(T) if T is not None else 120
+        H = int(H) if H is not None else 19
+        two_channel = True if (C is None or int(C) != 1) else False
+        cand_stacks = []
+        for g in cand_all_games:
+            mv = extract_moves_from_sgf(g, board_size=H)
+            st = moves_to_stack(mv, board_size=H, max_moves=T, two_channel=two_channel)
+            cand_stacks.append(st)
+        X_cand = np.stack(cand_stacks, axis=0)
     else:
         X_cand = texts_to_padded(cand_all_games, tokenizer, max_len)
     E_cand = compute_embeddings_array(X_cand, embed_model, batch_size=batch_size)
@@ -158,6 +178,13 @@ def run_few_shot(
                 fr = moves_to_frames(mv, board_size=H, history_k=history_k, max_moves=T)
                 query_frames.append(fr)
             Xq = np.stack(query_frames, axis=0)
+        elif use_stack:
+            query_stacks = []
+            for g in games:
+                mv = extract_moves_from_sgf(g, board_size=H)
+                st = moves_to_stack(mv, board_size=H, max_moves=T, two_channel=two_channel)
+                query_stacks.append(st)
+            Xq = np.stack(query_stacks, axis=0)
         else:
             Xq = texts_to_padded(games, tokenizer, max_len)
         Eq = compute_embeddings_array(Xq, embed_model, batch_size=batch_size)

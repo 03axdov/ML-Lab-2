@@ -80,25 +80,23 @@ def parse_sgf_file(filepath):
 
 
 def load_all_games(data_dir):
-    """Load all games and their player labels.
-
-    Returns two lists of equal length: one SGF string per game and the
-    corresponding label (player name) for each game.
-    """
+    """Load all SGF games and label each by its filename (without .sgf)."""
     all_games = []
     all_labels = []
 
-    # Sort files numerically if possible (e.g., "1.sgf".."200.sgf") for stability
     fnames = [f for f in os.listdir(data_dir) if f.endswith('.sgf')]
     fnames.sort(key=lambda x: int(os.path.splitext(x)[0]) if os.path.splitext(x)[0].isdigit() else x)
 
     for idx, fname in enumerate(fnames, start=1):
-        print(f"Parsing file {idx}: {fname}")
         path = os.path.join(data_dir, fname)
-        games, player_name = parse_sgf_file(path)
+        label = os.path.splitext(fname)[0]  # e.g., '1' for 1.sgf
+        print(f"Parsing file {idx}: {fname}")
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+        games = _split_top_level_sgf(text)
         for g in games:
             all_games.append(g)
-            all_labels.append(player_name)
+            all_labels.append(label)
 
     return all_games, all_labels
 
@@ -128,73 +126,56 @@ def extract_moves_from_sgf(sgf_text: str, board_size: int = 19):
     return moves
 
 
-def moves_to_frames(moves, board_size: int = 19, history_k: int = 4, max_moves: int = 200):
-    """Convert a move list into a sequence of spatial frames for CNN processing.
-
-    Each frame has shape (board_size, board_size, C) with C = 2*history_k + 2 planes:
-      - history_k planes for last k Black moves (one-hot)
-      - history_k planes for last k White moves (one-hot)
-      - 1 plane for current move one-hot
-      - 1 plane filled with 1.0 if current mover is Black else 0.0
-
-    The sequence is padded with zeros up to max_moves.
+def moves_to_frames(moves, board_size=19, history_k=8, max_moves=120):
     """
-    C = 2 * history_k + 2
+    Encode AlphaGo-style board states with safe normalization.
+
+    Each frame represents the current board after a move, plus the last `history_k` board states.
+    Planes:
+        0..(K-1):  black stones at t-K+1..t
+        K..(2K-1): white stones at t-K+1..t
+        2K:        player-to-move plane (1=black, 0=white)
+
+    Output shape: (max_moves, board_size, board_size, 2*K + 1)
+    """
+    import numpy as np
+
+    board = np.zeros((board_size, board_size), dtype=np.int8)
+    hist_black, hist_white, frames = [], [], []
     T = min(len(moves), max_moves)
-    frames = []
-    last_b = []
-    last_w = []
 
     for i in range(T):
         player, x, y = moves[i]
-        planes = []
-        # Build history planes for Black
-        for k in range(history_k):
-            plane = [[0.0] * board_size for _ in range(board_size)]
-            if k < len(last_b):
-                bx, by = last_b[-1 - k]
-                plane[by][bx] = 1.0
-            planes.append(plane)
-        # History planes for White
-        for k in range(history_k):
-            plane = [[0.0] * board_size for _ in range(board_size)]
-            if k < len(last_w):
-                wx, wy = last_w[-1 - k]
-                plane[wy][wx] = 1.0
-            planes.append(plane)
-        # Current move one-hot
-        cur = [[0.0] * board_size for _ in range(board_size)]
-        cur[y][x] = 1.0
-        planes.append(cur)
-        # Player plane (all ones for Black, zeros for White)
-        player_plane_val = 1.0 if player == 0 else 0.0
-        player_plane = [[player_plane_val] * board_size for _ in range(board_size)]
-        planes.append(player_plane)
+        board[y, x] = 1 if player == 0 else -1  # 1=black, -1=white
 
-        # Update history buffers
-        if player == 0:
-            last_b.append((x, y))
-        else:
-            last_w.append((x, y))
+        # record current board as binary planes
+        black_plane = (board == 1).astype(np.float32)
+        white_plane = (board == -1).astype(np.float32)
+        hist_black.append(black_plane)
+        hist_white.append(white_plane)
 
-        # Convert to numpy HWC
-        import numpy as _np
+        # pad history
+        blk_hist = hist_black[-history_k:]
+        wht_hist = hist_white[-history_k:]
+        while len(blk_hist) < history_k:
+            blk_hist.insert(0, np.zeros((board_size, board_size), np.float32))
+        while len(wht_hist) < history_k:
+            wht_hist.insert(0, np.zeros((board_size, board_size), np.float32))
 
-        frame = _np.stack([_np.array(p, dtype=_np.float32) for p in planes], axis=-1)  # HWC
-        frames.append(frame)
+        planes = blk_hist + wht_hist
 
-    import numpy as _np
+        # add player-to-move plane (1.0 if black to play next)
+        next_player = 1.0 if player == 1 else 0.0  # white just moved → black next
+        planes.append(np.full((board_size, board_size), next_player, np.float32))
 
-    if frames:
-        seq = _np.stack(frames, axis=0)  # THWC
+        frames.append(np.stack(planes, axis=-1))
+
+    # pad to max_moves
+    if len(frames) < max_moves:
+        pad = np.zeros((max_moves - len(frames), board_size, board_size, 2 * history_k + 1), np.float32)
+        seq = np.concatenate([np.stack(frames), pad], axis=0)
     else:
-        seq = _np.zeros((0, board_size, board_size, C), dtype=_np.float32)
+        seq = np.stack(frames[:max_moves], axis=0)
 
-    # Pad to max_moves
-    if seq.shape[0] < max_moves:
-        pad = _np.zeros((max_moves - seq.shape[0], board_size, board_size, C), dtype=_np.float32)
-        seq = _np.concatenate([seq, pad], axis=0)
-    elif seq.shape[0] > max_moves:
-        seq = seq[:max_moves]
-
-    return seq.astype(_np.float32)
+    # no normalization; keep true 0/1 sparsity
+    return seq.astype(np.float32)
