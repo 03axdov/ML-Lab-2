@@ -1,11 +1,20 @@
 import numpy as np
+from sklearn.preprocessing import LabelEncoder
 
+# Load encoder
+classes = np.load("data/processed/label_classes.npy", allow_pickle=True)
+print("Num classes in encoder:", len(classes))
+
+# Load one shard
 data = np.load("data/processed/games_shard_000.npz")
-X, y = data["X"], data["y"]
-print("Global min/max:", X.min(), X.max())
-print("Mean:", X.mean(), "Std:", X.std())
+y = data["y"]
+print("Label range in shard:", y.min(), y.max())
+print("Example IDs:", y[:10])
 
-# Check how many moves actually contain stones
-nonzero = np.count_nonzero(np.abs(X) > 0)
-total = np.prod(X.shape)
-print("Fraction non-zero:", nonzero / total)
+# Recreate encoder mapping
+le = LabelEncoder()
+le.classes_ = classes
+
+# Decode first few integer IDs back to original filenames
+decoded = le.inverse_transform(y[:10])
+print("Decoded filenames:", decoded)

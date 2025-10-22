@@ -63,9 +63,10 @@ def save_shard_streaming(X_buf, y_buf, shard):
 
     # Now reopen memory-mapped for compression
     X = np.memmap(mmap_path, dtype=np.float32, mode='r', shape=(n, *shape))
+    X_arr = np.array(X)  # <-- fully load into memory
     y = np.array(y_buf, dtype=np.int64)
-    np.savez_compressed(shard_path, X=X, y=y)
-    del X
+    np.savez_compressed(shard_path, X=X_arr, y=y)
+    del X, X_arr
     os.remove(mmap_path)
     print(f"✅ Saved shard {shard:03d} ({n} samples)")
     return shard + 1
@@ -77,8 +78,9 @@ def main():
     print(f"Loaded {len(games)} games from {len(set(labels))} unique labels")
 
     # ---- 1. Fit global encoder ----
+    unique_labels = sorted(set(labels), key=lambda x: int(x) if x.isdigit() else x)
     le = LabelEncoder()
-    le.fit(labels)
+    le.classes_ = np.array(unique_labels)
     np.save(os.path.join(OUT_DIR, "label_classes.npy"), le.classes_)
     y_all = le.transform(labels)
     num_classes = len(le.classes_)

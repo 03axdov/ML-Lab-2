@@ -3,7 +3,6 @@ import tensorflow as tf
 import numpy as np
 from dataset import prepare_frames_dataset
 
-
 # ---------------- Config ----------------
 BOARD_SIZE = 19
 HISTORY_K = 3           # must match preprocessing!
@@ -11,59 +10,70 @@ MAX_MOVES = 120
 BATCH_SIZE = 32
 
 
-# ---------------- Residual CNN Encoder ----------------
-def residual_block(x, filters, kernel_size=3):
-    """Residual block without BatchNorm (stable on float32 dense data)."""
-    y = tf.keras.layers.SeparableConv2D(filters, kernel_size, padding='same', use_bias=False)(x)
-    y = tf.keras.layers.ReLU()(y)
-    y = tf.keras.layers.SeparableConv2D(filters, kernel_size, padding='same', use_bias=False)(y)
-    if x.shape[-1] != filters:
-        x = tf.keras.layers.Conv2D(filters, 1, padding='same', use_bias=False)(x)
-    out = tf.keras.layers.ReLU()(tf.keras.layers.Add()([x, y]))
-    return out
-
-
-def build_move_encoder(input_shape, cnn_filters=32, cnn_blocks=2, mlp_units=96):
-    """Per-move CNN encoder for AlphaGo-style board planes."""
-    inp = tf.keras.Input(shape=input_shape)  # (H, W, C)
-    x = inp
-    for _ in range(cnn_blocks):
-        x = residual_block(x, cnn_filters)
-
-    # Global pooling + scaling to stabilize variance
-    x = tf.keras.layers.GlobalAveragePooling2D()(x)
-    x = tf.keras.layers.Lambda(lambda t: t * 5.0)(x)
+# ---------------- Simplified CNN Encoder ----------------
+def build_move_encoder(input_shape, cnn_filters=64, mlp_units=256):
+    """
+    Per-move CNN encoder without BatchNorm or Dropout — built to test pure learnability.
+    Uses Conv + ReLU + Flatten to preserve full spatial info.
+    """
+    inp = tf.keras.Input(shape=input_shape)
+    x = tf.keras.layers.Conv2D(cnn_filters, 3, padding='same', activation='relu')(inp)
+    x = tf.keras.layers.Conv2D(cnn_filters, 3, padding='same', activation='relu')(x)
+    x = tf.keras.layers.LayerNormalization(dtype='float32')(x)
+    x = tf.keras.layers.Flatten()(x)
     x = tf.keras.layers.Dense(mlp_units, activation='relu')(x)
     return tf.keras.Model(inp, x, name='per_move_encoder')
 
 
-# ---------------- Full Game Model ----------------
-def build_game_model(input_shape, num_classes, cnn_filters=32, cnn_blocks=2, move_dim=96, rnn_units=128, embed_dim=128):
-    """Full temporal Go game model with CNN+GRU architecture."""
-    seq_inp = tf.keras.Input(shape=input_shape)  # (max_moves, 19, 19, C)
+# ---------------- Game-level Model ----------------
+def build_game_model(board_size=19, history_k=3, max_moves=120, num_classes=200):
+    """
+    Simplified GRU-based model for overfit testing.
+    """
+    C = 2 * history_k + 1  # = 7 for K=3
+    seq_inp = tf.keras.Input(shape=(max_moves, board_size, board_size, C))
 
-    per_move = build_move_encoder(input_shape[1:], cnn_filters, cnn_blocks, move_dim)
+    # Encode each move (per-move CNN)
+    per_move = build_move_encoder((board_size, board_size, C))
     x = tf.keras.layers.TimeDistributed(per_move)(seq_inp)
 
-    # Mask padded timesteps
-    x = tf.keras.layers.Masking(mask_value=0.0)(x)
+    # Temporal summarization
+    x = tf.keras.layers.Bidirectional(tf.keras.layers.GRU(256, return_sequences=False))(x)
 
-    # Bidirectional GRU summarization
-    x = tf.keras.layers.Bidirectional(
-        tf.keras.layers.GRU(rnn_units, return_sequences=False)
-    )(x)
+    # Dense classifier head
+    x = tf.keras.layers.Dense(256, activation='relu')(x)
     x = tf.keras.layers.Dropout(0.3)(x)
-
-    # Embedding projection
-    game_vec = tf.keras.layers.Dense(embed_dim, activation='tanh', name='game_vec')(x)
-    norm_vec = tf.keras.layers.Lambda(lambda t: tf.math.l2_normalize(t, axis=1), name='norm')(game_vec)
-
-    # Classifier head
-    out = tf.keras.layers.Dense(num_classes, activation='softmax', dtype='float32', name='cls')(norm_vec)
+    x = tf.keras.layers.Dense(128, activation='relu')(x)
+    x = tf.keras.layers.LayerNormalization(dtype='float32')(x)
+    out = tf.keras.layers.Dense(num_classes, activation='softmax', dtype='float32')(x)
 
     model = tf.keras.Model(seq_inp, out)
-    embed_model = tf.keras.Model(seq_inp, norm_vec, name='embed_model')
-    return model, embed_model
+    return model
+
+
+# ---------------- Overfit Test ----------------
+def test_overfit(model, train_ds):
+    """Train on a tiny subset to verify learnability (should reach >0.95 acc)."""
+    small_x, small_y = next(iter(train_ds))
+    small_x, small_y = small_x[:32], small_y[:32]
+    print("Overfit test batch:", small_x.shape, small_y.shape)
+
+    model_copy = tf.keras.models.clone_model(model)
+    model_copy.set_weights(model.get_weights())
+    model_copy.compile(
+        optimizer=tf.keras.optimizers.Adam(1e-3),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"]
+    )
+
+    history = model_copy.fit(
+        small_x, small_y,
+        epochs=100,
+        verbose=0
+    )
+
+    final_acc = history.history["accuracy"][-1]
+    print(f"✅ Final overfit accuracy: {final_acc:.4f}")
 
 
 # ---------------- Training Entry ----------------
@@ -82,27 +92,20 @@ def main():
     num_classes = len(label_encoder.classes_)
     print(f"Detected {num_classes} classes.")
 
-        
-    x_batch, y_batch = next(iter(train_ds))
-    print(tf.reduce_min(x_batch).numpy(), tf.reduce_max(x_batch).numpy())
-
     # Build model
-    model, embed_model = build_game_model(
-        input_shape=input_shape,
+    model = build_game_model(
+        board_size=BOARD_SIZE,
+        history_k=HISTORY_K,
+        max_moves=MAX_MOVES,
         num_classes=num_classes,
     )
 
     model.summary()
 
-    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
-    model.compile(
-        loss="sparse_categorical_crossentropy",
-        optimizer=optimizer,
-        metrics=["accuracy"],
-    )
+    # --- Step 1: overfit test ---
+    test_overfit(model, train_ds)
 
-
-    # --- Gradient sanity check ---
+    # --- Step 2: sanity check gradients ---
     with tf.GradientTape() as tape:
         preds = model(x_batch[:4])
         loss = tf.keras.losses.sparse_categorical_crossentropy(y_batch[:4], preds)
@@ -112,12 +115,18 @@ def main():
     )
     print(f"Non-zero gradient tensors: {nonzero}/{len([g for g in grads if g is not None])}")
 
-    # --- Train ---
+    # --- Step 3: full training ---
+    optimizer = tf.keras.optimizers.Adam(learning_rate=5e-4)
+    model.compile(
+        loss="sparse_categorical_crossentropy",
+        optimizer=optimizer,
+        metrics=["accuracy"],
+    )
+
     model.fit(train_ds, epochs=10)
 
     os.makedirs("models", exist_ok=True)
     model.save("models/cls_model.keras")
-    embed_model.save("models/embed_model.keras")
     print("✅ Models saved.")
 
 
