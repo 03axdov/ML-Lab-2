@@ -1,54 +1,16 @@
 import os
 import tensorflow as tf
-import numpy as np
 from dataset import prepare_frames_dataset
+from model import build_game_model
+from tensorflow.keras import mixed_precision
+mixed_precision.set_global_policy("mixed_float16")
+
 
 # ---------------- Config ----------------
 BOARD_SIZE = 19
 HISTORY_K = 3           # must match preprocessing!
 MAX_MOVES = 120
 BATCH_SIZE = 32
-
-
-# ---------------- Simplified CNN Encoder ----------------
-def build_move_encoder(input_shape, cnn_filters=64, mlp_units=256):
-    """
-    Per-move CNN encoder without BatchNorm or Dropout — built to test pure learnability.
-    Uses Conv + ReLU + Flatten to preserve full spatial info.
-    """
-    inp = tf.keras.Input(shape=input_shape)
-    x = tf.keras.layers.Conv2D(cnn_filters, 3, padding='same', activation='relu')(inp)
-    x = tf.keras.layers.Conv2D(cnn_filters, 3, padding='same', activation='relu')(x)
-    x = tf.keras.layers.LayerNormalization(dtype='float32')(x)
-    x = tf.keras.layers.Flatten()(x)
-    x = tf.keras.layers.Dense(mlp_units, activation='relu')(x)
-    return tf.keras.Model(inp, x, name='per_move_encoder')
-
-
-# ---------------- Game-level Model ----------------
-def build_game_model(board_size=19, history_k=3, max_moves=120, num_classes=200):
-    """
-    Simplified GRU-based model for overfit testing.
-    """
-    C = 2 * history_k + 1  # = 7 for K=3
-    seq_inp = tf.keras.Input(shape=(max_moves, board_size, board_size, C))
-
-    # Encode each move (per-move CNN)
-    per_move = build_move_encoder((board_size, board_size, C))
-    x = tf.keras.layers.TimeDistributed(per_move)(seq_inp)
-
-    # Temporal summarization
-    x = tf.keras.layers.Bidirectional(tf.keras.layers.GRU(256, return_sequences=False))(x)
-
-    # Dense classifier head
-    x = tf.keras.layers.Dense(256, activation='relu')(x)
-    x = tf.keras.layers.Dropout(0.3)(x)
-    x = tf.keras.layers.Dense(128, activation='relu')(x)
-    x = tf.keras.layers.LayerNormalization(dtype='float32')(x)
-    out = tf.keras.layers.Dense(num_classes, activation='softmax', dtype='float32')(x)
-
-    model = tf.keras.Model(seq_inp, out)
-    return model
 
 
 # ---------------- Overfit Test ----------------
@@ -79,9 +41,10 @@ def test_overfit(model, train_ds):
 # ---------------- Training Entry ----------------
 def main():
     print("Loading dataset...")
-    train_ds, label_encoder = prepare_frames_dataset(
+    train_ds, val_ds, label_encoder = prepare_frames_dataset(
         shard_pattern="data/processed/games_shard_*.npz",
         batch_size=BATCH_SIZE,
+        val_split=0.1,
     )
 
     # Peek one batch to infer shape
@@ -123,7 +86,7 @@ def main():
         metrics=["accuracy"],
     )
 
-    model.fit(train_ds, epochs=10)
+    model.fit(train_ds, validation_data=val_ds, epochs=10)
 
     os.makedirs("models", exist_ok=True)
     model.save("models/cls_model.keras")
