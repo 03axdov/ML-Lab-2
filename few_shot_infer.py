@@ -1,25 +1,43 @@
 import os
 import re
-import argparse
-import pickle
-from typing import Dict, List, Tuple
-
 import numpy as np
 import tensorflow as tf
+from typing import Dict, List, Tuple
+from tensorflow.keras import mixed_precision
 
-from data_parser import parse_sgf_file, extract_moves_from_sgf, moves_to_frames, moves_to_stack
+from data_parser import parse_sgf_file, extract_moves_from_sgf, moves_to_frames
+
+mixed_precision.set_global_policy("mixed_float16")
+
+# ---------- GPU setup ----------
+gpus = tf.config.list_physical_devices("GPU")
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"✅ Enabled memory growth on {len(gpus)} GPU(s).")
+    except RuntimeError:
+        pass
 
 
-def texts_to_padded(texts: List[str], tokenizer, max_len: int) -> np.ndarray:
-    seqs = tokenizer.texts_to_sequences(texts)
-    return tf.keras.preprocessing.sequence.pad_sequences(
-        seqs, maxlen=max_len, padding="post", truncating="post"
-    )
+# ---------- Embedding helpers ----------
+
+@tf.function
+def _embed_step(batch, model):
+    """Fast compiled embedding call."""
+    return model(batch, training=False)
 
 
 def compute_embeddings_array(x: np.ndarray, model: tf.keras.Model, batch_size: int = 64) -> np.ndarray:
-    embs = model.predict(x, batch_size=batch_size, verbose=0)
-    # L2 normalize
+    """Compute L2-normalized embeddings efficiently on GPU."""
+    embs = []
+    for start in range(0, len(x), batch_size):
+        end = start + batch_size
+        xb = tf.convert_to_tensor(x[start:end], dtype=tf.float16)  # mixed precision inference
+        eb = _embed_step(xb, model)
+        embs.append(eb.numpy())
+        del xb, eb
+    embs = np.concatenate(embs, axis=0)
     norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12
     return embs / norms
 
@@ -34,8 +52,7 @@ def build_prototypes(embs: np.ndarray, labels: np.ndarray, k: int = 5, seed: int
         if len(idx) > k > 0:
             idx = rng.choice(idx, size=k, replace=False)
         p = embs[idx].mean(axis=0)
-        p = p / (np.linalg.norm(p) + 1e-12)
-        protos[int(c)] = p
+        protos[int(c)] = p / (np.linalg.norm(p) + 1e-12)
     return protos
 
 
@@ -43,13 +60,15 @@ def predict_by_prototypes(query_embs: np.ndarray, prototypes: Dict[int, np.ndarr
     if not prototypes:
         return np.array([]), np.array([])
     classes = np.array(sorted(prototypes.keys()))
-    P = np.stack([prototypes[int(c)] for c in classes], axis=0)  # [C, D]
+    P = np.stack([prototypes[int(c)] for c in classes], axis=0)
     sims = np.matmul(query_embs, P.T)
     pred_ix = sims.argmax(axis=1)
     preds = classes[pred_ix]
     best_sims = sims.max(axis=1)
     return preds, best_sims
 
+
+# ---------- File utilities ----------
 
 def _numeric_id_from_name(name: str) -> int:
     base = os.path.splitext(os.path.basename(name))[0]
@@ -65,137 +84,87 @@ def _list_sgf_sorted(dir_path: str) -> List[str]:
     return files
 
 
+# ---------- Few-shot inference ----------
+
 def run_few_shot(
     cand_dir: str = "data/test_set/cand_set",
     query_dir: str = "data/test_set/query_set",
     embed_model_path: str = "models/embed_model.keras",
-    tokenizer_path: str = "cache/tokenizer.pkl",
-    max_len: int = 2000,
+    classifier_model_path: str = "models/cls_model.keras",
     k_shots: int = 5,
-    batch_size: int = 64,
+    batch_size: int = 8,  # small batch for GPU safety
     out_csv: str = "predictions.csv",
 ) -> List[Tuple[int, int]]:
-    """Run few-shot inference without CLI.
 
-    Returns a list of (query_id, predicted_candidate_id). Also writes a CSV if
-    out_csv is provided.
-    """
-    # Load embedding model (and tokenizer if token-based)
-    embed_model = tf.keras.models.load_model(embed_model_path)
-    input_shape = embed_model.input_shape
-    if isinstance(input_shape, list):
-        ishape = input_shape[0]
+    # --- Load or create embedding model ---
+    if os.path.exists(embed_model_path):
+        print(f"🧠 Loading embedding model: {embed_model_path}")
+        embed_model = tf.keras.models.load_model(embed_model_path)
+    elif os.path.exists(classifier_model_path):
+        print(f"⚙️ Extracting embedding submodel from {classifier_model_path} ...")
+        base_model = tf.keras.models.load_model(classifier_model_path)
+        embed_model = tf.keras.Model(
+            inputs=base_model.input,
+            outputs=base_model.layers[-2].output  # Dense(64,tanh)
+        )
+        os.makedirs(os.path.dirname(embed_model_path), exist_ok=True)
+        embed_model.save(embed_model_path)
+        print(f"✅ Saved embedding model to {embed_model_path}")
     else:
-        ishape = input_shape
-    use_frames_or_stack = len(ishape) == 5  # [B, T, H, W, C]
-    use_stack = False
-    use_frames = False
-    if use_frames_or_stack:
-        # Decide by channel count: small C (<=4) => stack, else frames with history
-        _, T_in, H_in, W_in, C_in = ishape
-        if C_in is not None and int(C_in) <= 4:
-            use_stack = True
-        else:
-            use_frames = True
-    tokenizer = None
-    if not (use_frames or use_stack):
-        with open(tokenizer_path, "rb") as f:
-            tokenizer = pickle.load(f)
+        raise FileNotFoundError("Neither embed_model.keras nor cls_model.keras found.")
 
-    # Load candidates per file; label = numeric id from filename (e.g., 1..600)
+    _, T, H, W, C = embed_model.input_shape
+    history_k = (C - 1) // 2
+
+    # --- Candidates ---
     cand_files = _list_sgf_sorted(cand_dir)
-    if not cand_files:
-        raise RuntimeError(f"No candidate .sgf files found in {cand_dir}")
+    cand_ids, frames, labels = [], [], []
+    print(f"📚 Encoding candidate games ({len(cand_files)} files)...")
 
-    cand_ids: List[int] = []
-    cand_all_games: List[str] = []
-    cand_all_labels: List[int] = []
     for fname in cand_files:
         cid = _numeric_id_from_name(fname)
-        path = os.path.join(cand_dir, fname)
-        games, _ = parse_sgf_file(path)
+        games, _ = parse_sgf_file(os.path.join(cand_dir, fname))
         if not games:
             continue
-        # Optionally subsample to K shots per candidate when building prototypes
         if k_shots > 0 and len(games) > k_shots:
-            games = games[: k_shots]
-        cand_ids.append(cid)
-        cand_all_games.extend(games)
-        cand_all_labels.extend([cid] * len(games))
-
-    if not cand_all_games:
-        raise RuntimeError("No candidate games parsed.")
-
-    # Encode candidates (frames or tokens); build prototype per candidate id
-    if use_frames:
-        # infer T,H,W,C from model input
-        _, T, H, W, C = ishape
-        T = int(T) if T is not None else 200
-        H = int(H) if H is not None else 19
-        history_k = (int(C) - 2) // 2 if C is not None else 4
-        cand_frames = []
-        for g in cand_all_games:
+            games = games[:k_shots]
+        for g in games:
             mv = extract_moves_from_sgf(g, board_size=H)
             fr = moves_to_frames(mv, board_size=H, history_k=history_k, max_moves=T)
-            cand_frames.append(fr)
-        X_cand = np.stack(cand_frames, axis=0)
-    elif use_stack:
-        _, T, H, W, C = ishape
-        T = int(T) if T is not None else 120
-        H = int(H) if H is not None else 19
-        two_channel = True if (C is None or int(C) != 1) else False
-        cand_stacks = []
-        for g in cand_all_games:
-            mv = extract_moves_from_sgf(g, board_size=H)
-            st = moves_to_stack(mv, board_size=H, max_moves=T, two_channel=two_channel)
-            cand_stacks.append(st)
-        X_cand = np.stack(cand_stacks, axis=0)
-    else:
-        X_cand = texts_to_padded(cand_all_games, tokenizer, max_len)
-    E_cand = compute_embeddings_array(X_cand, embed_model, batch_size=batch_size)
-    cand_all_labels = np.array(cand_all_labels, dtype=np.int32)
-    prototypes = build_prototypes(E_cand, cand_all_labels, k=0)  # already limited by K shots
-    if not prototypes:
-        raise RuntimeError("Failed to build any prototypes from candidates.")
+            frames.append(fr)
+            labels.append(cid)
+        cand_ids.append(cid)
 
-    # Load queries per file; output one prediction per query file id
+    labels = np.array(labels, dtype=np.int32)
+    print(f"🧩 Computing candidate embeddings on GPU...")
+    E_cand = compute_embeddings_array(np.array(frames, dtype=np.float16), embed_model, batch_size)
+    prototypes = build_prototypes(E_cand, labels, k=0)
+    del frames, E_cand
+
+    # --- Queries ---
     query_files = _list_sgf_sorted(query_dir)
-    if not query_files:
-        raise RuntimeError(f"No query .sgf files found in {query_dir}")
+    results: List[Tuple[int, int]] = []
+    print(f"🔍 Predicting {len(query_files)} queries...")
 
-    results: List[Tuple[int, int]] = []  # (query_id, pred_candidate_id)
     for fname in query_files:
         qid = _numeric_id_from_name(fname)
-        path = os.path.join(query_dir, fname)
-        games, _ = parse_sgf_file(path)
+        print(f"Processing {qid}")
+        games, _ = parse_sgf_file(os.path.join(query_dir, fname))
         if not games:
             continue
-        if use_frames:
-            query_frames = []
-            # reuse inferred T,H from above
-            for g in games:
-                mv = extract_moves_from_sgf(g, board_size=H)
-                fr = moves_to_frames(mv, board_size=H, history_k=history_k, max_moves=T)
-                query_frames.append(fr)
-            Xq = np.stack(query_frames, axis=0)
-        elif use_stack:
-            query_stacks = []
-            for g in games:
-                mv = extract_moves_from_sgf(g, board_size=H)
-                st = moves_to_stack(mv, board_size=H, max_moves=T, two_channel=two_channel)
-                query_stacks.append(st)
-            Xq = np.stack(query_stacks, axis=0)
-        else:
-            Xq = texts_to_padded(games, tokenizer, max_len)
-        Eq = compute_embeddings_array(Xq, embed_model, batch_size=batch_size)
-        # Aggregate a query prototype by averaging all games in the file
+        q_frames = []
+        for g in games:
+            mv = extract_moves_from_sgf(g, board_size=H)
+            fr = moves_to_frames(mv, board_size=H, history_k=history_k, max_moves=T)
+            q_frames.append(fr)
+        Xq = np.array(q_frames, dtype=np.float16)
+        Eq = compute_embeddings_array(Xq, embed_model, batch_size)
         q_proto = Eq.mean(axis=0)
-        q_proto = q_proto / (np.linalg.norm(q_proto) + 1e-12)
-        pred_id_arr, _ = predict_by_prototypes(q_proto[None, :], prototypes)
-        pred_cid = int(pred_id_arr[0])
-        results.append((qid, pred_cid))
+        q_proto /= (np.linalg.norm(q_proto) + 1e-12)
+        pred_id, _ = predict_by_prototypes(q_proto[None, :], prototypes)
+        results.append((qid, int(pred_id[0])))
 
-    # Write CSV with columns id,label sorted by id
+    # --- Save ---
     results.sort(key=lambda x: x[0])
     if out_csv:
         os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
@@ -204,9 +173,9 @@ def run_few_shot(
             for qid, pred in results:
                 f.write(f"{qid},{pred}\n")
 
-    print(f"Candidates: {len(prototypes)} | Queries: {len(results)}")
+    print(f"✅ Done. Candidates: {len(prototypes)} | Queries: {len(results)}")
     if out_csv:
-        print(f"Wrote predictions to {out_csv}")
+        print(f"📁 Predictions saved to {out_csv}")
     return results
 
 
