@@ -103,10 +103,11 @@ def run_few_shot(
     elif os.path.exists(classifier_model_path):
         print(f"⚙️ Extracting embedding submodel from {classifier_model_path} ...")
         base_model = tf.keras.models.load_model(classifier_model_path)
-        embed_model = tf.keras.Model(
-            inputs=base_model.input,
-            outputs=base_model.layers[-2].output  # Dense(64,tanh)
-        )
+        try:
+            out = base_model.get_layer("embedding").output
+        except Exception:
+            out = base_model.layers[-2].output  # fallback for older checkpoints
+        embed_model = tf.keras.Model(inputs=base_model.input, outputs=out)
         os.makedirs(os.path.dirname(embed_model_path), exist_ok=True)
         embed_model.save(embed_model_path)
         print(f"✅ Saved embedding model to {embed_model_path}")
